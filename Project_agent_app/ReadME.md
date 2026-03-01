@@ -1,6 +1,6 @@
 # 💼 Enterprise HR Policy Assistant
 
-An AI-powered **Enterprise HR Policy Assistant** built with Python, langchain and langraph workdlows , with Endee vector database.  
+An AI-powered **Enterprise HR Policy Assistant** built with Python, langchain and langraph workdlows , with Endee vector database using strova-ai/hr-policies-qa-dataset 
 It allows employees to query company policies, while HR/admin/CEO users can add or edit policies (in work). The assistant leverages **RAG (Retrieval-Augmented Generation)** for accurate, context-aware answers.
 
 ---
