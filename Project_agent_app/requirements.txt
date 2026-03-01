@@ -1,0 +1,9 @@
+streamlit
+langchain
+langgraph
+langchain-google-genai
+sentence-transformers
+requests
+python-dotenv
+endee
+numpy
