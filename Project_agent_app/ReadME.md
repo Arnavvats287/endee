@@ -1,6 +1,15 @@
+<div align="center">
+   
 # 💼 Enterprise HR Policy Assistant
 
+</div>
+
+<div align="center">
+   
 An AI-powered **Enterprise HR Policy Assistant** built with Python, langchain and langraph workdlows , with Endee vector database using strova-ai/hr-policies-qa-dataset.
+</div>
+
+---
 
 It allows employees to query company policies, while HR/admin/CEO users can add or edit policies (in work). The assistant leverages **RAG (Retrieval-Augmented Generation)** for accurate, context-aware answers.
 
@@ -9,15 +18,16 @@ It allows employees to query company policies, while HR/admin/CEO users can add 
 ## 🚀 Table of Contents
 
 1. [Project Overview & Problem Statement](#project-overview--problem-statement)  
-2. [System Design & Technical Approach](#system-design--technical-approach)  
-3. [Requirements](#requirements)  
-4. [Setup Instructions](#setup-instructions)  
+2. [System Design & Technical Approach](#system-design--technical-approach)
+3. [System Visualisations](#system-visualisation)
+4. [Requirements](#requirements)  
+5. [Setup Instructions](#setup-instructions)  
    - [Clone & Setup Environment](#clone--setup-environment)  
    - [Docker & Endee Setup](#docker--endee-setup)  
    - [Running the App](#running-the-app)  
-5. [How Endee is Used](#how-endee-is-used)  
-6. [Usage](#usage)  
-7. [Project Structure](#project-structure)  
+6. [How Endee is Used](#how-endee-is-used)  
+7. [Usage](#usage)  
+8. [Project Structure](#project-structure)  
 
 ---
 
@@ -56,6 +66,24 @@ It allows employees to query company policies, while HR/admin/CEO users can add 
 User input -> Intent Detection -> Lead Capture / Policy Node ->
 [If Policy Node] -> Embed query -> Search Endee -> Generate Answer -> Display
 ```
+
+## System Visualisations
+
+<div align="center">
+   
+### Coversation Start
+
+![Coversation Start](images/home.png)
+
+### RAG retrieval message
+
+![RAG retrieval message](images/answer.png)
+
+### Structured JSON Output+ download 
+
+![Structured JSON Output+ download ](images/rag.png)
+
+</div>
 
 ## 📝 Requirements
 
