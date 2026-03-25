@@ -8,17 +8,19 @@
 #include <mutex>
 #include <memory>
 #include <unordered_map>
+#include "log.hpp"
 #include "settings.hpp"
+#include "../core/types.hpp"
 #include "mdbx/mdbx.h"
 #include "quant/common.hpp"
 
 struct IndexMetadata {
     std::string name;  // Just the index name, not the full path
     size_t dimension;
-    size_t sparse_dim = 0;  // Added sparse dimension
+    ndd::SparseScoringModel sparse_model = ndd::SparseScoringModel::NONE;
     std::string space_type_str;
     ndd::quant::QuantizationLevel quant_level =
-            ndd::quant::QuantizationLevel::INT8;  // Quantization level (8, 15, 16, 32)
+            ndd::quant::QuantizationLevel::INT8;  // Selected quantization level
     int32_t checksum;
     size_t total_elements;
     size_t M;
@@ -28,7 +30,7 @@ struct IndexMetadata {
     nlohmann::json to_json() const {
         return {{"name", name},
                 {"dimension", dimension},
-                {"sparse_dim", sparse_dim},
+                {"sparse_model", ndd::sparseScoringModelToString(sparse_model)},
                 {"space_type_str", space_type_str},
                 {"quant_level", static_cast<uint8_t>(quant_level)},
                 {"checksum", checksum},
@@ -42,11 +44,17 @@ struct IndexMetadata {
         IndexMetadata meta;
         meta.name = j["name"].get<std::string>();
         meta.dimension = j["dimension"].get<size_t>();
-        if(j.contains("sparse_dim")) {
-            meta.sparse_dim = j["sparse_dim"].get<size_t>();
-        } else {
-            meta.sparse_dim = 0;
+        if(!j.contains("sparse_model")) {
+            throw std::runtime_error(
+                    "Incompatible index metadata: missing sparse_model. Recreate the index.");
         }
+        const auto sparse_model =
+                ndd::sparseScoringModelFromString(j["sparse_model"].get<std::string>());
+        if(!sparse_model.has_value()) {
+            throw std::runtime_error(
+                    "Incompatible index metadata: invalid sparse_model. Recreate the index.");
+        }
+        meta.sparse_model = *sparse_model;
         meta.space_type_str = j["space_type_str"].get<std::string>();
         meta.quant_level =
                 static_cast<ndd::quant::QuantizationLevel>(j["quant_level"].get<uint8_t>());
@@ -83,7 +91,8 @@ public:
         MDBX_txn* txn;
         int rc = mdbx_txn_begin(metadata_env_, nullptr, MDBX_TXN_READWRITE, &txn);
         if(rc != 0) {
-            std::cerr << "Failed to begin transaction: " << mdbx_strerror(rc) << std::endl;
+            LOG_ERROR(
+                    1501, index_id, "Failed to begin metadata transaction: " << mdbx_strerror(rc));
             return false;
         }
 
@@ -95,20 +104,22 @@ public:
             rc = mdbx_put(txn, metadata_dbi_, &db_key, &data, MDBX_UPSERT);
             if(rc != 0) {
                 mdbx_txn_abort(txn);
-                std::cerr << "Failed to store metadata: " << mdbx_strerror(rc) << std::endl;
+                LOG_ERROR(
+                        1502, index_id, "Failed to store metadata: " << mdbx_strerror(rc));
                 return false;
             }
 
             rc = mdbx_txn_commit(txn);
             if(rc != 0) {
-                std::cerr << "Failed to commit transaction: " << mdbx_strerror(rc) << std::endl;
+                LOG_ERROR(
+                        1503, index_id, "Failed to commit metadata transaction: " << mdbx_strerror(rc));
                 return false;
             }
 
             return true;
         } catch(const std::exception& e) {
             mdbx_txn_abort(txn);
-            std::cerr << "Exception while storing metadata: " << e.what() << std::endl;
+            LOG_ERROR(1504, index_id, "Exception while storing metadata: " << e.what());
             return false;
         }
     }
@@ -117,8 +128,7 @@ public:
     bool updateElementCount(const std::string& index_id, size_t count) {
         auto metadata = getMetadata(index_id);
         if(!metadata) {
-            std::cerr << "Cannot update element count: metadata not found for " << index_id
-                      << std::endl;
+            LOG_WARN(1505, index_id, "Cannot update element count because metadata was not found");
             return false;
         }
         metadata->total_elements = count;
@@ -132,7 +142,8 @@ public:
         MDBX_txn* txn;
         int rc = mdbx_txn_begin(metadata_env_, nullptr, MDBX_TXN_RDONLY, &txn);
         if(rc != 0) {
-            std::cerr << "Failed to begin transaction: " << mdbx_strerror(rc) << std::endl;
+            LOG_ERROR(
+                    1506, index_id, "Failed to begin metadata read transaction: " << mdbx_strerror(rc));
             return std::nullopt;
         }
 
@@ -144,7 +155,8 @@ public:
             if(rc != 0) {
                 mdbx_txn_abort(txn);
                 if(rc != MDBX_NOTFOUND) {
-                    std::cerr << "Failed to retrieve metadata: " << mdbx_strerror(rc) << std::endl;
+                    LOG_ERROR(
+                            1507, index_id, "Failed to retrieve metadata: " << mdbx_strerror(rc));
                 }
                 return std::nullopt;
             }
@@ -155,7 +167,7 @@ public:
             return IndexMetadata::from_json(nlohmann::json::parse(json_str));
         } catch(const std::exception& e) {
             mdbx_txn_abort(txn);
-            std::cerr << "Exception while retrieving metadata: " << e.what() << std::endl;
+            LOG_ERROR(1508, index_id, "Exception while retrieving metadata: " << e.what());
             return std::nullopt;
         }
     }
@@ -166,7 +178,8 @@ public:
         MDBX_txn* txn;
         int rc = mdbx_txn_begin(metadata_env_, nullptr, MDBX_TXN_READWRITE, &txn);
         if(rc != MDBX_SUCCESS) {
-            std::cerr << "Failed to begin transaction: " << mdbx_strerror(rc) << std::endl;
+            LOG_ERROR(
+                    1509, index_id, "Failed to begin metadata delete transaction: " << mdbx_strerror(rc));
             return false;
         }
 
@@ -176,20 +189,22 @@ public:
             rc = mdbx_del(txn, metadata_dbi_, &db_key, nullptr);
             if(rc != MDBX_SUCCESS && rc != MDBX_NOTFOUND) {
                 mdbx_txn_abort(txn);
-                std::cerr << "Failed to delete metadata: " << mdbx_strerror(rc) << std::endl;
+                LOG_ERROR(
+                        1510, index_id, "Failed to delete metadata: " << mdbx_strerror(rc));
                 return false;
             }
 
             rc = mdbx_txn_commit(txn);
             if(rc != MDBX_SUCCESS) {
-                std::cerr << "Failed to commit transaction: " << mdbx_strerror(rc) << std::endl;
+                LOG_ERROR(
+                        1511, index_id, "Failed to commit metadata delete transaction: " << mdbx_strerror(rc));
                 return false;
             }
 
             return true;
         } catch(const std::exception& e) {
             mdbx_txn_abort(txn);
-            std::cerr << "Exception while deleting metadata: " << e.what() << std::endl;
+            LOG_ERROR(1512, index_id, "Exception while deleting metadata: " << e.what());
             return false;
         }
     }
@@ -201,7 +216,8 @@ public:
         MDBX_txn* txn;
         int rc = mdbx_txn_begin(metadata_env_, nullptr, MDBX_TXN_RDONLY, &txn);
         if(rc != 0) {
-            std::cerr << "Failed to begin transaction: " << mdbx_strerror(rc) << std::endl;
+            LOG_ERROR(
+                    1513, "Failed to begin list-all metadata transaction: " << mdbx_strerror(rc));
             return result;
         }
 
@@ -209,7 +225,7 @@ public:
         rc = mdbx_cursor_open(txn, metadata_dbi_, &cursor);
         if(rc != 0) {
             mdbx_txn_abort(txn);
-            std::cerr << "Failed to open cursor: " << mdbx_strerror(rc) << std::endl;
+            LOG_ERROR(1514, "Failed to open metadata cursor: " << mdbx_strerror(rc));
             return result;
         }
 
@@ -221,7 +237,7 @@ public:
                 result.push_back(
                         {key_str, IndexMetadata::from_json(nlohmann::json::parse(json_str))});
             } catch(const std::exception& e) {
-                std::cerr << "Failed to parse metadata: " << e.what() << std::endl;
+                LOG_ERROR(1515, "Failed to parse metadata while listing all metadata: " << e.what());
                 // Skip invalid entries
             }
         }
@@ -240,7 +256,8 @@ public:
         MDBX_txn* txn;
         int rc = mdbx_txn_begin(metadata_env_, nullptr, MDBX_TXN_RDONLY, &txn);
         if(rc != 0) {
-            std::cerr << "Failed to begin transaction: " << mdbx_strerror(rc) << std::endl;
+            LOG_ERROR(
+                    1516, username, "Failed to begin list-user metadata transaction: " << mdbx_strerror(rc));
             return indexes;
         }
 
@@ -248,7 +265,7 @@ public:
         rc = mdbx_cursor_open(txn, metadata_dbi_, &cursor);
         if(rc != 0) {
             mdbx_txn_abort(txn);
-            std::cerr << "Failed to open cursor: " << mdbx_strerror(rc) << std::endl;
+            LOG_ERROR(1517, username, "Failed to open metadata cursor: " << mdbx_strerror(rc));
             return indexes;
         }
 
@@ -270,8 +287,8 @@ public:
                     // Add to result
                     indexes.emplace_back(index_name, std::move(metadata));
                 } catch(const std::exception& e) {
-                    std::cerr << "Failed to parse metadata for index " << key_str << ": "
-                              << e.what() << std::endl;
+                    LOG_ERROR(
+                            1518, key_str, "Failed to parse metadata for index: " << e.what());
                     // Skip invalid entries
                 }
             }
@@ -288,7 +305,8 @@ public:
         MDBX_txn* txn;
         int rc = mdbx_txn_begin(metadata_env_, nullptr, MDBX_TXN_RDONLY, &txn);
         if(rc != 0) {
-            std::cerr << "Failed to begin transaction: " << mdbx_strerror(rc) << std::endl;
+            LOG_ERROR(
+                    1519, "Failed to begin list-all indexes transaction: " << mdbx_strerror(rc));
             return result;
         }
 
@@ -296,7 +314,7 @@ public:
         rc = mdbx_cursor_open(txn, metadata_dbi_, &cursor);
         if(rc != 0) {
             mdbx_txn_abort(txn);
-            std::cerr << "Failed to open cursor: " << mdbx_strerror(rc) << std::endl;
+            LOG_ERROR(1520, "Failed to open list-all indexes cursor: " << mdbx_strerror(rc));
             return result;
         }
 
@@ -308,7 +326,7 @@ public:
                 IndexMetadata metadata = IndexMetadata::from_json(nlohmann::json::parse(json_str));
                 result.emplace_back(key_str, std::move(metadata));
             } catch(const std::exception& e) {
-                std::cerr << "Failed to parse metadata: " << e.what() << std::endl;
+                LOG_ERROR(1521, "Failed to parse metadata while listing all indexes: " << e.what());
                 // skip bad record
             }
         }

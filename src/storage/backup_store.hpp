@@ -148,7 +148,10 @@ public:
         try {
             std::ifstream f(path);
             return nlohmann::json::parse(f);
-        } catch (...) {
+        } catch (const std::exception& e) {
+            LOG_WARN(1304,
+                          username,
+                          "Failed to parse backup metadata file " << path << ": " << e.what());
             return nlohmann::json::object();
         }
     }
@@ -166,9 +169,9 @@ public:
         if (std::filesystem::exists(temp_dir)) {
             try {
                 std::filesystem::remove_all(temp_dir);
-                LOG_INFO("Cleaned up backup temp directory");
+                LOG_INFO(1301, "Cleaned up backup temp directory");
             } catch (const std::exception& e) {
-                LOG_ERROR("Failed to cleanup backup temp directory: " << e.what());
+                LOG_ERROR(1302, "Failed to clean up backup temp directory: " << e.what());
             }
         }
     }
@@ -216,26 +219,9 @@ public:
 
     // Backup listing
 
-    std::vector<std::string> listBackups(const std::string& username) {
-        std::vector<std::string> backups;
-        std::string backup_dir = getUserBackupDir(username);
-
-        if(!std::filesystem::exists(backup_dir)) {
-            return backups;
-        }
-
-        for(const auto& entry : std::filesystem::directory_iterator(backup_dir)) {
-            if(entry.is_regular_file()) {
-                std::string filename = entry.path().filename().string();
-
-                if(filename.size() > 4 && filename.substr(filename.size() - 4) == ".tar" &&
-                   !filename.starts_with(".tmp_")) {
-                    std::string backup_name = filename.substr(0, filename.size() - 4);
-                    backups.push_back(backup_name);
-                }
-            }
-        }
-        return backups;
+    nlohmann::json listBackups(const std::string& username) {
+        nlohmann::json backup_list_json = readBackupJson(username);
+        return backup_list_json;
     }
 
     // Backup deletion
@@ -256,7 +242,7 @@ public:
             backup_db.erase(backup_name);
             writeBackupJson(username, backup_db);
 
-            LOG_INFO("Deleted backup: " << backup_tar);
+            LOG_INFO(1303, username, "Deleted backup " << backup_tar);
             return {true, ""};
         } else {
             return {false, "Backup not found"};

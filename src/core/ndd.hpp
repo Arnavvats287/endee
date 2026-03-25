@@ -4,6 +4,7 @@
 
 #include "hnsw/hnswlib.h"
 #include "settings.hpp"
+#include "types.hpp"
 #include "id_mapper.hpp"
 #include "vector_storage.hpp"
 #include "../sparse/sparse_storage.hpp"
@@ -30,7 +31,7 @@
 
 struct IndexConfig {
     size_t dim;
-    size_t sparse_dim = 0;  // 0 means dense-only
+    ndd::SparseScoringModel sparse_model = ndd::SparseScoringModel::NONE;
     size_t max_elements = settings::MAX_ELEMENTS;
     std::string space_type_str;
     size_t M = settings::DEFAULT_M;
@@ -43,10 +44,10 @@ struct IndexConfig {
 struct IndexInfo {
     size_t total_elements;
     size_t dimension;
-    size_t sparse_dim;
+    ndd::SparseScoringModel sparse_model = ndd::SparseScoringModel::NONE;
     std::string space_type_str;
     ndd::quant::QuantizationLevel
-            quant_level;  // Quantization level (8, 15, 16, 32) - replaces use_fp16
+            quant_level;  // Selected quantization level
     int32_t checksum;
     size_t M;
     size_t ef_con;
@@ -54,7 +55,7 @@ struct IndexInfo {
 
 struct CacheEntry {
     std::string index_id;
-    size_t sparse_dim = 0;
+    ndd::SparseScoringModel sparse_model = ndd::SparseScoringModel::NONE;
     std::unique_ptr<hnswlib::HierarchicalNSW<float>> alg;
     std::shared_ptr<IDMapper> id_mapper;
     std::shared_ptr<VectorStorage> vector_storage;
@@ -74,31 +75,31 @@ struct CacheEntry {
         last_access(std::chrono::system_clock::now()) {}
 
     CacheEntry(std::string index_id_,
-               size_t sparse_dim_,
+               ndd::SparseScoringModel sparse_model_,
                std::unique_ptr<hnswlib::HierarchicalNSW<float>> alg_,
                std::shared_ptr<IDMapper> mapper_,
                std::shared_ptr<VectorStorage> storage_,
                std::unique_ptr<ndd::SparseVectorStorage> sparse_storage_,
                std::chrono::system_clock::time_point access_time_) {
-        LOG_INFO("Creating CacheEntry for index: " << index_id_);
+        LOG_INFO(2001, index_id_, "Creating cache entry");
 
         // Validate all components
         if(!alg_) {
-            LOG_ERROR("Algorithm is null");
+            LOG_ERROR(2002, index_id_, "Algorithm is null");
             throw std::runtime_error("Algorithm is null");
         }
         if(!mapper_) {
-            LOG_ERROR("ID Mapper is null");
+            LOG_ERROR(2003, index_id_, "ID mapper is null");
             throw std::runtime_error("ID Mapper is null");
         }
         if(!storage_) {
-            LOG_ERROR("Vector Storage is null");
+            LOG_ERROR(2004, index_id_, "Vector storage is null");
             throw std::runtime_error("Vector Storage is null");
         }
 
-        LOG_INFO("Assigning index_id: " << index_id_);
+        LOG_INFO(2005, index_id_, "Assigning index id");
         index_id = std::move(index_id_);
-        sparse_dim = sparse_dim_;
+        sparse_model = sparse_model_;
 
         id_mapper = std::move(mapper_);
 
@@ -108,12 +109,12 @@ struct CacheEntry {
 
         last_access = access_time_;
 
-        LOG_INFO("Moving algorithm instance");
+        LOG_INFO(2006, index_id, "Moving algorithm instance");
         alg = std::move(alg_);
 
         last_saved_at = std::chrono::system_clock::now();
 
-        LOG_INFO("CacheEntry construction completed");
+        LOG_INFO(2007, index_id, "Cache entry construction completed");
     }
 
     void markUpdated() {
@@ -137,6 +138,7 @@ struct PersistenceConfig {
 };
 
 #include "../storage/backup_store.hpp"
+#include "rebuild.hpp"
 
 class IndexManager {
 private:
@@ -156,7 +158,10 @@ private:
     // Write-ahead log for each index
     std::unordered_map<std::string, std::unique_ptr<WriteAheadLog>> wal_logs_;
     BackupStore backup_store_;
+    Rebuild rebuild_;
     void executeBackupJob(const std::string& index_id, const std::string& backup_name);
+    void executeRebuildJob(const std::string& index_id, const std::string& username,
+                           size_t new_M, size_t new_ef_con);
 
     // New methods to handle WAL
     WriteAheadLog* getOrCreateWAL(const std::string& index_id) {
@@ -166,7 +171,7 @@ private:
         }
 
         std::string wal_dir = data_dir_ + "/" + index_id;
-        auto wal = std::make_unique<WriteAheadLog>(wal_dir);
+        auto wal = std::make_unique<WriteAheadLog>(wal_dir, index_id);
         auto wal_ptr = wal.get();
         wal_logs_[index_id] = std::move(wal);
         return wal_ptr;
@@ -186,10 +191,10 @@ private:
 
         // Check if WAL has entries needing recovery
         if(wal->hasEntries()) {
-            LOG_INFO("WAL recovery needed for index " << index_id);
+            LOG_INFO(2008, index_id, "WAL recovery needed");
 
             auto wal_entries = wal->readEntries();
-            LOG_INFO("Read " << wal_entries.size() << " entries from WAL");
+            LOG_INFO(2009, index_id, "Read " << wal_entries.size() << " entries from WAL");
 
             // Process all entries in the exact order they were recorded
             std::vector<idInt> failed_vector_add_ids;
@@ -233,8 +238,10 @@ private:
             // Add failed VECTOR_ADD IDs back to deleted_ids for reuse
             if(!failed_vector_add_ids.empty()) {
                 entry.id_mapper->reclaim_failed_ids(failed_vector_add_ids);
-                LOG_INFO("Reclaimed " << failed_vector_add_ids.size()
-                                      << " failed VECTOR_ADD IDs for reuse");
+                LOG_INFO(2010,
+                               index_id,
+                               "Reclaimed " << failed_vector_add_ids.size()
+                                            << " failed VECTOR_ADD ids for reuse");
             }
 
             // Mark as updated to trigger a save
@@ -249,7 +256,7 @@ private:
 
     // The thread will call this method
     void autosaveLoop() {
-        LOG_INFO("Autosave thread started");
+        LOG_INFO(2011, "Autosave thread started");
         while(running_) {
             // Sleep for 5 minutes
             std::this_thread::sleep_for(std::chrono::minutes(5));
@@ -258,10 +265,10 @@ private:
             if(!running_) {
                 break;
             }
-            LOG_INFO("Autosave check running");
+            LOG_INFO(2012, "Autosave check running");
             checkAndSaveIndices();
         }
-        LOG_INFO("Autosave thread stopped");
+        LOG_INFO(2013, "Autosave thread stopped");
     }
 
     // Check and save indices based on update time
@@ -375,8 +382,8 @@ private:
 
         // Update element count in metadata
         if(!metadata_manager_->updateElementCount(entry.index_id, entry.alg->getElementsCount())) {
-            std::cerr << "Warning: Failed to update element count in metadata for "
-                      << entry.index_id << std::endl;
+            LOG_WARN(
+                    2014, entry.index_id, "Failed to update element count in metadata");
         }
         entry.updated = false;
     }
@@ -404,14 +411,13 @@ public:
 
                     // Only evict if the index is not dirty (hasn't been updated)
                     if(it->second.updated) {
-                        LOG_WARN("Cannot evict dirty index " << to_evict
-                                                             << " - needs saving first");
+                        LOG_WARN(2015, to_evict, "Cannot evict dirty index; it must be saved first");
                         // Put it back at the front to try other indices
                         indices_list_.push_front(to_evict);
                         continue;
                     }
 
-                    LOG_INFO("Evicting clean index " << to_evict);
+                    LOG_INFO(2016, to_evict, "Evicting clean index from cache");
                     indices_.erase(it);
                 }
             }
@@ -475,6 +481,7 @@ public:
         backup_store_(data_dir) {
         std::filesystem::create_directories(data_dir);
         metadata_manager_ = std::make_unique<MetadataManager>(data_dir);
+        rebuild_.cleanupTempFiles(data_dir);
         // Start the autosave thread
         autosave_thread_ = std::thread(&IndexManager::autosaveLoop, this);
     }
@@ -499,8 +506,9 @@ public:
                         saveIndex(pair.first);
                     }
                 } catch(const std::exception& e) {
-                    std::cerr << "Failed to save index " << pair.first
-                              << " during shutdown: " << e.what() << std::endl;
+                    LOG_ERROR(2017,
+                                    pair.first,
+                                    "Failed to save index during shutdown: " << e.what());
                 }
             }
             LOG_DEBUG("Shutdown complete");
@@ -521,13 +529,13 @@ public:
 
         // 1. Fail if directory doesn't exist
         if(!std::filesystem::exists(base_path)) {
-            LOG_ERROR("Index directory does not exist: " << base_path);
+            LOG_ERROR(2018, index_id, "Index directory does not exist: " << base_path);
             return false;
         }
 
         // 2. Fail if index file already exists
         if(std::filesystem::exists(index_path)) {
-            LOG_ERROR("Index file already exists: " << index_path);
+            LOG_ERROR(2019, index_id, "Index file already exists: " << index_path);
             return false;
         }
 
@@ -550,7 +558,7 @@ public:
         fout << "0:0\n";
         fout.close();
 
-        LOG_INFO("Index reset complete and saved: " << index_id);
+        LOG_INFO(2020, index_id, "Index reset complete and saved");
         return true;
     }
 
@@ -604,8 +612,9 @@ public:
         std::string lmdb_dir = index_dir + "/ids";
 
         //create the directory and initialize sequence for IDMapper
-        LOG_INFO("Creating IDMapper for index "
-                 << index_id << " with user type: " << userTypeToString(user_type));
+        LOG_INFO(2021,
+                       index_id,
+                       "Creating ID mapper with user type " << userTypeToString(user_type));
 
         // IDMapper now uses tier-based fixed bloom filter sizing based on user_type
         auto id_mapper = std::make_shared<IDMapper>(lmdb_dir, true, user_type);
@@ -614,13 +623,14 @@ public:
         // Create HNSW directly with all necessary parameters
         ndd::quant::QuantizationLevel quant_level = config.quant_level;
         auto vector_storage =
-                std::make_shared<VectorStorage>(index_dir, config.dim, config.quant_level);
+                std::make_shared<VectorStorage>(index_dir, index_id, config.dim, config.quant_level);
 
         // Initialize Sparse Storage if needed
         std::unique_ptr<ndd::SparseVectorStorage> sparse_storage = nullptr;
-        if(config.sparse_dim > 0) {
+        if(ndd::sparseModelEnabled(config.sparse_model)) {
             std::string sparse_storage_dir = index_dir + "/sparse";
-            sparse_storage = std::make_unique<ndd::SparseVectorStorage>(sparse_storage_dir);
+            sparse_storage = std::make_unique<ndd::SparseVectorStorage>(
+                sparse_storage_dir, index_id, config.sparse_model);
             if(!sparse_storage->initialize()) {
                 throw std::runtime_error("Failed to initialize sparse storage");
             }
@@ -654,7 +664,7 @@ public:
                     indices_.emplace(std::piecewise_construct,
                                      std::forward_as_tuple(index_id),
                                      std::forward_as_tuple(index_id,
-                                                           config.sparse_dim,
+                                                           config.sparse_model,
                                                            std::move(alg),
                                                            id_mapper,
                                                            vector_storage,
@@ -668,7 +678,7 @@ public:
         IndexMetadata metadata_entry;
         metadata_entry.name = index_name;
         metadata_entry.dimension = config.dim;
-        metadata_entry.sparse_dim = config.sparse_dim;
+        metadata_entry.sparse_model = config.sparse_model;
         metadata_entry.space_type_str = config.space_type_str;
         metadata_entry.quant_level = config.quant_level;
         metadata_entry.checksum = config.checksum;
@@ -681,7 +691,7 @@ public:
             throw std::runtime_error("Failed to store index metadata");
         }
 
-        LOG_INFO("Saving newly created index " << index_id);
+        LOG_INFO(2022, index_id, "Saving newly created index");
         // Index is marked as updated so it needs to be saved immediately for crash recovery
         saveIndex(index_id);
         return true;
@@ -708,12 +718,13 @@ public:
             throw std::runtime_error("Required files missing for index: " + index_id);
         }
 
-        // Load metadata to get sparse_dim
+        // Load metadata to get sparse_model
         auto metadata = metadata_manager_->getMetadata(index_id);
-        size_t sparse_dim = 0;
-        if(metadata) {
-            sparse_dim = metadata->sparse_dim;
+        if(!metadata) {
+            throw std::runtime_error("Missing or incompatible index metadata for index: "
+                                     + index_id);
         }
+        const ndd::SparseScoringModel sparse_model = metadata->sparse_model;
 
         // Step 1: Load HNSW index (automatically adjusts cache based on element count and cache
         // percentage)
@@ -728,13 +739,14 @@ public:
         // Step 2: Create IDMapper and VectorStorage - IDMapper handles bloom filter initialization
         auto id_mapper = std::make_shared<IDMapper>(lmdb_dir, false);
         auto vector_storage = std::make_shared<VectorStorage>(
-                index_dir, alg->getDimension(), alg->getQuantLevel());
+                index_dir, index_id, alg->getDimension(), alg->getQuantLevel());
 
-        // Initialize Sparse Storage if sparse_dim > 0
+        // Initialize Sparse Storage if sparse_model is enabled
         std::unique_ptr<ndd::SparseVectorStorage> sparse_storage;
-        if(sparse_dim > 0) {
+        if(ndd::sparseModelEnabled(sparse_model)) {
             std::string sparse_storage_dir = index_dir + "/sparse";
-            sparse_storage = std::make_unique<ndd::SparseVectorStorage>(sparse_storage_dir);
+            sparse_storage = std::make_unique<ndd::SparseVectorStorage>(
+                sparse_storage_dir, index_id, sparse_model);
             if(!sparse_storage->initialize()) {
                 throw std::runtime_error("Failed to initialize sparse storage for index: "
                                          + index_id);
@@ -759,7 +771,7 @@ public:
                 indices_.emplace(std::piecewise_construct,
                                  std::forward_as_tuple(index_id),
                                  std::forward_as_tuple(index_id,
-                                                       sparse_dim,
+                                                       sparse_model,
                                                        std::move(alg),
                                                        id_mapper,
                                                        vector_storage,
@@ -774,7 +786,7 @@ public:
     // Reload index: save (if updated), evict from memory, and reload
     // Cache size is automatically checked and adjusted if < 5% of element count during reload
     bool reload(const std::string& index_id) {
-        LOG_INFO("Starting reload for " << index_id);
+        LOG_INFO(2023, index_id, "Starting reload");
 
         try {
             // Phase 1: Save index if it was updated
@@ -798,7 +810,7 @@ public:
                         indices_list_.erase(list_it);
                     }
                     indices_.erase(it);
-                    LOG_INFO("Evicted " << index_id << " from cache");
+                    LOG_INFO(2024, index_id, "Evicted index from cache");
                 }
             }
 
@@ -811,15 +823,16 @@ public:
                 auto it = indices_.find(index_id);
                 if(it != indices_.end()) {
                     // Cache removed
-                    LOG_INFO("Reloaded "
-                             << index_id << ", bloom: fixed size"
-                             << ", index elements: " << it->second.alg->getElementsCount());
+                    LOG_INFO(2025,
+                                   index_id,
+                                   "Reloaded index with "
+                                           << it->second.alg->getElementsCount() << " elements");
                 }
             }
 
             return true;
         } catch(const std::exception& e) {
-            LOG_ERROR("Failed to reload " << index_id << ": " << e.what());
+            LOG_ERROR(2026, index_id, "Failed to reload index: " << e.what());
             return false;
         }
     }
@@ -894,13 +907,19 @@ public:
             // Handle Sparse Vectors if storage is initialized
             if(entry.sparse_storage) {
                 if constexpr(std::is_same_v<VectorType, ndd::HybridVectorObject>) {
+                    /**
+                     * Forward every hybrid doc, including empty sparse payloads, so the sparse
+                     * storage layer can treat upserts as replacements and clear old sparse state.
+                     */
                     std::vector<std::pair<ndd::idInt, ndd::SparseVector>> sparse_batch;
                     sparse_batch.reserve(vectors.size());
 
                     for(size_t i = 0; i < vectors.size(); ++i) {
                         const auto& vec = vectors[i];
+                        ndd::SparseVector sparse_vec;
                         if(!vec.sparse_ids.empty()) {
-                            // Sort indices and values together
+                            // Sort indices and values together so replacement writes preserve the
+                            // inverted index ordering invariants.
                             std::vector<std::pair<uint32_t, float>> pairs;
                             pairs.reserve(vec.sparse_ids.size());
                             for(size_t k = 0; k < vec.sparse_ids.size(); ++k) {
@@ -910,20 +929,25 @@ public:
                                 return a.first < b.first;
                             });
 
-                            ndd::SparseVector sparse_vec;
                             sparse_vec.indices.reserve(pairs.size());
                             sparse_vec.values.reserve(pairs.size());
                             for(const auto& p : pairs) {
                                 sparse_vec.indices.push_back(p.first);
                                 sparse_vec.values.push_back(p.second);
                             }
-
-                            sparse_batch.emplace_back(numeric_ids[i].first, std::move(sparse_vec));
                         }
+
+                        sparse_batch.emplace_back(numeric_ids[i].first, std::move(sparse_vec));
                     }
 
                     if(!sparse_batch.empty()) {
-                        entry.sparse_storage->store_vectors_batch(sparse_batch);
+                        if(!entry.sparse_storage->store_vectors_batch(sparse_batch)) {
+                            LOG_ERROR(2053,
+                                      index_id,
+                                      "Failed to update sparse storage for batch size "
+                                              << sparse_batch.size());
+                            return false;
+                        }
                     }
                 }
             }
@@ -976,8 +1000,8 @@ public:
                     // Calculate start and end indices for this thread
                     size_t start_idx = t * chunk_size;
                     size_t end_idx = (start_idx + chunk_size < quantized_vectors.size())
-                                             ? (start_idx + chunk_size)
-                                             : quantized_vectors.size();
+                                            ? (start_idx + chunk_size)
+                                            : quantized_vectors.size();
 
                     // Process assigned chunk of vectors
                     for(size_t i = start_idx; i < end_idx; i++) {
@@ -1020,7 +1044,7 @@ public:
             // so it can be caught by API layer and returned as proper JSON error
             throw;
         } catch(const std::exception& e) {
-            std::cerr << "Batch insertion failed: " << e.what() << std::endl;
+            LOG_ERROR(2027, index_id, "Batch insertion failed: " << e.what());
             return false;
         }
     }
@@ -1032,7 +1056,7 @@ public:
         std::string recover_file = base_path + "/recover.txt";
 
         if(!std::filesystem::exists(recover_file)) {
-            LOG_ERROR("Recover file not found: " << recover_file);
+            LOG_ERROR(2028, index_id, "Recover file not found: " << recover_file);
             return false;
         }
 
@@ -1044,14 +1068,14 @@ public:
 
         auto colon = line.find(':');
         if(colon == std::string::npos) {
-            LOG_ERROR("Invalid recover.txt format");
+            LOG_ERROR(2029, index_id, "Invalid recover.txt format");
             return false;
         }
 
         size_t offset = std::stoull(line.substr(0, colon));
         int flag = std::stoi(line.substr(colon + 1));
         if(flag == 1) {
-            LOG_INFO("Recovery already in progress for: " << index_id);
+            LOG_INFO(2030, index_id, "Recovery already in progress");
             return false;
         }
 
@@ -1080,7 +1104,7 @@ public:
         }
 
         if(batch.empty()) {
-            LOG_INFO("No more vectors to recover");
+            LOG_INFO(2031, index_id, "No more vectors to recover");
             std::ofstream fout(recover_file);
             fout << offset << ":0\n";  // just mark as not busy
             return true;
@@ -1089,6 +1113,7 @@ public:
         // Step 5: Insert in parallel like addVectors()
         size_t num_threads = std::min(settings::NUM_RECOVERY_THREADS, batch.size());
         std::atomic<size_t> next{0};
+        std::atomic<size_t> empty_vector_count{0};
         std::vector<std::thread> threads;
 
         for(size_t t = 0; t < num_threads; ++t) {
@@ -1099,7 +1124,7 @@ public:
                     if(!vec_bytes.empty()) {
                         entry.alg->addPoint<true>(vec_bytes.data(), label);
                     } else {
-                        LOG_ERROR("Skipping label " << label << " due to empty vector");
+                        empty_vector_count.fetch_add(1);
                     }
                 }
             });
@@ -1109,7 +1134,13 @@ public:
             th.join();
         }
 
-        LOG_INFO("Recovered " << batch.size() << " vectors to index: " << index_id);
+        if(empty_vector_count.load() > 0) {
+            LOG_WARN(2032,
+                           index_id,
+                           "Skipped " << empty_vector_count.load() << " vectors during recovery because they were empty");
+        }
+
+        LOG_INFO(2033, index_id, "Recovered " << batch.size() << " vectors");
 
         // Step 6: Save index
         // Mark the index as updated so that it will be saved
@@ -1153,7 +1184,7 @@ public:
 
             return obj;
         } catch(const std::exception& e) {
-            std::cerr << "Error retrieving vector: " << e.what() << std::endl;
+            LOG_ERROR(2034, index_id, "Error retrieving vector: " << e.what());
             return std::nullopt;
         }
     }
@@ -1174,7 +1205,9 @@ public:
                 // Remove the filter
                 entry.vector_storage->deleteFilter(numeric_id, meta.filter);
                 // Mark as deleted in HNSW index
+
                 entry.alg->markDelete(numeric_id);
+
                 // Delete from sparse storage if hybrid index
                 if(entry.sparse_storage) {
                     entry.sparse_storage->delete_vector(numeric_id);
@@ -1188,7 +1221,7 @@ public:
 
             return true;
         } catch(const std::exception& e) {
-            std::cerr << "Failed to delete vectors: " << e.what() << std::endl;
+            LOG_ERROR(2035, entry.index_id, "Failed to delete vectors: " << e.what());
             return false;
         }
     }
@@ -1220,7 +1253,7 @@ public:
             // Re-throw runtime_error (includes backup-in-progress check)
             throw;
         } catch(const std::exception& e) {
-            std::cerr << "Failed to delete vectors by filter: " << e.what() << std::endl;
+            LOG_ERROR(2036, index_id, "Failed to delete vectors by filter: " << e.what());
             return 0;
         }
     }
@@ -1254,7 +1287,7 @@ public:
             // Re-throw runtime_error (includes backup-in-progress check)
             throw;
         } catch(const std::exception& e) {
-            std::cerr << "Failed to update filters: " << e.what() << std::endl;
+            LOG_ERROR(2037, index_id, "Failed to update filters: " << e.what());
             return 0;
         }
     }
@@ -1290,7 +1323,7 @@ public:
             // Re-throw runtime_error (includes backup-in-progress check)
             throw;
         } catch(const std::exception& e) {
-            std::cerr << "Failed to delete vector: " << e.what() << std::endl;
+            LOG_ERROR(2038, index_id, "Failed to delete vector: " << e.what());
             return false;
         }
     }
@@ -1307,92 +1340,119 @@ public:
 
     std::optional<std::vector<ndd::VectorResult>>
     searchKNN(const std::string& index_id,
-              const std::vector<float>& query,
-              const std::vector<uint32_t>& sparse_indices,
-              const std::vector<float>& sparse_values,
-              size_t k,
-              const nlohmann::json& filter_array,
-              ndd::FilterParams params = {},
-              bool include_vectors = false,
-              size_t ef = 0) {
+                const std::vector<float>& query,
+                const std::vector<uint32_t>& sparse_indices,
+                const std::vector<float>& sparse_values,
+                size_t k,
+                const nlohmann::json& filter_array,
+                ndd::FilterParams params = {},
+                bool include_vectors = false,
+                size_t ef = 0)
+    {
+        /**
+         * Keep the hybrid weights local for now. The next API step can pass one weight
+         * per ranked list and reuse the same weighted RRF accumulation below.
+         * TODO: to be received from search API.
+         */
+        constexpr float kDenseRrfWeight = 0.5f;
+        constexpr float kSparseRrfWeight = 0.5f;
+        constexpr float kRrfRankConstant = 60.0f;
         try {
             auto& entry = getIndexEntry(index_id);
             entry.searchCount += k;
 
+            const bool run_dense_search = kDenseRrfWeight > 0.0f && !query.empty();
+
+            const bool run_sparse_search =
+                    kSparseRrfWeight > 0.0f && entry.sparse_storage && !sparse_indices.empty();
+
+            // Zero-weight sources cannot influence the final ranking, so skip their retrieval
+            // work entirely.
+            if(!run_dense_search && !run_sparse_search) {
+                return std::vector<ndd::VectorResult>();
+            }
+
             // 0. Compute Filter Bitmap (Shared)
             std::optional<ndd::RoaringBitmap> active_filter_bitmap;
             if (!filter_array.empty()) {
-                 active_filter_bitmap = entry.vector_storage->filter_store_->computeFilterBitmap(filter_array);
+                active_filter_bitmap = entry.vector_storage->filter_store_->computeFilterBitmap(filter_array);
             }
+            const ndd::RoaringBitmap* filter_ptr =
+                    active_filter_bitmap ? &(*active_filter_bitmap) : nullptr;
 
             // 1. Sparse Search (Async)
             std::future<std::vector<std::pair<ndd::idInt, float>>> sparse_future;
-            if(entry.sparse_storage && !sparse_indices.empty()) {
-                sparse_future = std::async(std::launch::async, [&]() {
+            if(run_sparse_search) {
+                sparse_future = std::async(std::launch::async, [&, filter_ptr]() {
                     ndd::SparseVector sparse_query;
-                    // Sort indices and values together
-                    std::vector<std::pair<uint32_t, float>> pairs;
-                    pairs.reserve(sparse_indices.size());
-                    for(size_t i = 0; i < sparse_indices.size(); ++i) {
-                        pairs.emplace_back(sparse_indices[i], sparse_values[i]);
-                    }
-                    std::sort(pairs.begin(), pairs.end(), [](const auto& a, const auto& b) {
-                        return a.first < b.first;
-                    });
 
-                    sparse_query.indices.reserve(pairs.size());
-                    sparse_query.values.reserve(pairs.size());
-                    for(const auto& p : pairs) {
-                        sparse_query.indices.push_back(p.first);
-                        sparse_query.values.push_back(p.second);
+                    // Reuse the caller's ordering when it is already sorted so we do not copy
+                    // the same sparse payload into an extra temporary representation.
+                    if(std::is_sorted(sparse_indices.begin(), sparse_indices.end())) {
+                        sparse_query.indices = sparse_indices;
+                        sparse_query.values = sparse_values;
+                    } else {
+                        std::vector<std::pair<uint32_t, float>> pairs;
+                        pairs.reserve(sparse_indices.size());
+                        for(size_t i = 0; i < sparse_indices.size(); ++i) {
+                            pairs.emplace_back(sparse_indices[i], sparse_values[i]);
+                        }
+                        std::sort(pairs.begin(), pairs.end(), [](const auto& a, const auto& b) {
+                            return a.first < b.first;
+                        });
+
+                        sparse_query.indices.resize(pairs.size());
+                        sparse_query.values.resize(pairs.size());
+                        for(size_t i = 0; i < pairs.size(); ++i) {
+                            sparse_query.indices[i] = pairs[i].first;
+                            sparse_query.values[i] = pairs[i].second;
+                        }
                     }
 
-                    const ndd::RoaringBitmap* filter_ptr = active_filter_bitmap.has_value() ? &(*active_filter_bitmap) : nullptr;
                     return entry.sparse_storage->search(sparse_query, k, filter_ptr);
                 });
             }
 
             // 2. Dense Search (Main Thread)
             std::vector<std::pair<float, ndd::idInt>> dense_results;
-
-            if(!query.empty()) {
+            if(run_dense_search) {
                 // Convert query to bytes using the wrapper method
                 ndd::quant::QuantizationLevel quant_level = entry.alg->getQuantLevel();
                 auto space = entry.alg->getSpace();
                 std::vector<uint8_t> query_bytes =
                         ndd::quant::get_quantizer_dispatch(quant_level).quantize(query);
 
-                if (!active_filter_bitmap) {
-                     dense_results = entry.alg->searchKnn(query_bytes.data(), k, ef);
+                if(!filter_ptr) {
+                    dense_results = entry.alg->searchKnn(query_bytes.data(), k, ef);
                 } else {
                     // Smart Filter Execution Strategy
-                    auto& bitmap = *active_filter_bitmap;
+                    const auto& bitmap = *filter_ptr;
                     size_t card = bitmap.cardinality();
 
                     if (card == 0) {
                         // No results match filter
                     } else if (card < params.prefilter_threshold) {
                          // Strategy A: Brute Force on Small Subset
-                         std::vector<ndd::idInt> valid_ids;
-                         valid_ids.reserve(card);
-                         bitmap.iterate([](ndd::idInt id, void* ptr){
-                            static_cast<std::vector<ndd::idInt>*>(ptr)->push_back(id);
-                            return true;
-                         }, &valid_ids);
+                        std::vector<ndd::idInt> valid_ids;
+                        valid_ids.reserve(card);
+                        bitmap.iterate([](ndd::idInt id, void* ptr){
+                        static_cast<std::vector<ndd::idInt>*>(ptr)->push_back(id);
+                        return true;
+                        }, &valid_ids);
 
                          // Fetch vectors
-                         auto vector_batch = entry.vector_storage->get_vectors_batch(valid_ids);
-                         
-                         // Prepare subset for bruteforce search
-                         std::vector<std::pair<idInt, std::vector<uint8_t>>> vector_subset;
-                         vector_subset.reserve(vector_batch.size());
-                         for(const auto& [nid, vbytes] : vector_batch) {
-                             vector_subset.emplace_back(nid, vbytes);
-                         }
-                         
-                         dense_results = hnswlib::searchKnnSubset<float>(
-                             query_bytes.data(), vector_subset, k, space);
-                         
+                        auto vector_batch = entry.vector_storage->get_vectors_batch(valid_ids);
+
+                        // Prepare subset for bruteforce search
+                        std::vector<std::pair<idInt, std::vector<uint8_t>>> vector_subset;
+                        vector_subset.reserve(vector_batch.size());
+                        for(auto& [nid, vbytes] : vector_batch) {
+                            vector_subset.emplace_back(nid, std::move(vbytes));
+                        }
+
+                        dense_results = hnswlib::searchKnnSubset<float>(
+                            query_bytes.data(), vector_subset, k, space);
+
                     } else {
                         // Strategy B: Filtered HNSW Search
                         BitMapFilterFunctor functor(bitmap);
@@ -1401,9 +1461,17 @@ public:
                         // Try to use optimized templated search if algorithm matches
                         auto* hnsw_alg = dynamic_cast<hnswlib::HierarchicalNSW<float>*>(entry.alg.get());
                         if (hnsw_alg) {
-                             dense_results = hnsw_alg->searchKnn(query_bytes.data(), k, effective_ef, &functor, params.boost_percentage);
+                            dense_results = hnsw_alg->searchKnn(query_bytes.data(),
+                                                                k,
+                                                                effective_ef,
+                                                                &functor,
+                                                                params.boost_percentage);
                         } else {
-                             dense_results = entry.alg->searchKnn(query_bytes.data(), k, effective_ef, &functor, params.boost_percentage);
+                            dense_results = entry.alg->searchKnn(query_bytes.data(),
+                                                                    k,
+                                                                    effective_ef,
+                                                                    &functor,
+                                                                    params.boost_percentage);
                         }
                     }
                 }
@@ -1415,7 +1483,7 @@ public:
                 sparse_results = sparse_future.get();
             }
 
-            // 3. Combine Results
+            // 4. Combine Results
             std::vector<std::pair<float, ndd::idInt>> final_candidates;
 
             if(dense_results.empty() && sparse_results.empty()) {
@@ -1433,17 +1501,30 @@ public:
                     final_candidates.emplace_back(p.second, p.first);
                 }
             } else {
-                // Hybrid results - RRF
+                // Hybrid results - weighted RRF.
                 std::unordered_map<ndd::idInt, float> combined_scores;
-                const float k_rrf = 60.0f;
+                combined_scores.reserve(dense_results.size() + sparse_results.size());
 
-                for(size_t i = 0; i < dense_results.size(); ++i) {
-                    combined_scores[dense_results[i].second] += 1.0f / (k_rrf + i + 1);
-                }
+                // Reuse the dense and sparse result buffers directly so hybrid fusion does not
+                // build another copied view of the same ranked lists.
+                auto add_weighted_rrf_scores = [&](const auto& ranked_results,
+                                                    float weight,
+                                                    auto extract_id){
+                    if(weight <= 0.0f) {
+                        return;
+                    }
 
-                for(size_t i = 0; i < sparse_results.size(); ++i) {
-                    combined_scores[sparse_results[i].first] += 1.0f / (k_rrf + i + 1);
-                }
+                    for(size_t i = 0; i < ranked_results.size(); ++i) {
+                        const ndd::idInt id = extract_id(ranked_results[i]);
+                        combined_scores[id] +=
+                                weight / (kRrfRankConstant + static_cast<float>(i) + 1.0f);
+                    }
+                };
+
+                add_weighted_rrf_scores(
+                        dense_results, kDenseRrfWeight, [](const auto& result) { return result.second; });
+                add_weighted_rrf_scores(
+                        sparse_results, kSparseRrfWeight, [](const auto& result) { return result.first; });
 
                 final_candidates.reserve(combined_scores.size());
                 for(const auto& [id, score] : combined_scores) {
@@ -1451,8 +1532,8 @@ public:
                 }
 
                 std::sort(final_candidates.begin(),
-                          final_candidates.end(),
-                          [](const auto& a, const auto& b) { return a.first > b.first; });
+                            final_candidates.end(),
+                            [](const auto& a, const auto& b) { return a.first > b.first; });
             }
 
             std::vector<ndd::VectorResult> results;
@@ -1466,7 +1547,7 @@ public:
                 ndd::VectorMeta meta = entry.vector_storage->get_meta(p.second);
 
                 // Apply filter
-                if(active_filter_bitmap && !active_filter_bitmap->contains(p.second)) {
+                if(filter_ptr && !filter_ptr->contains(p.second)) {
                     continue;
                 }
 
@@ -1485,7 +1566,7 @@ public:
                         std::vector<float> float_data =
                                 ndd::quant::get_quantizer_dispatch(quant_level)
                                         .dequantize(vec_bytes.data(), entry.alg->getDimension());
-                        result.vector = {float_data.begin(), float_data.end()};
+                        result.vector = std::move(float_data);
                     }
                 }
 
@@ -1498,113 +1579,13 @@ public:
                 }
             }
 
-            // Fallback logic removed
-            if(false) {
-                size_t filter_cardinality =
-                        entry.vector_storage->filter_store_->countIdsMatchingFilter(filter_array);
-                LOG_DEBUG("Post-filter gave poor results ("
-                          << filtered_count << "/" << k
-                          << "), checking pre-filter option. Cardinality: " << filter_cardinality);
-
-                if(filter_cardinality < params.prefilter_threshold) {
-                    LOG_DEBUG("Using pre-filter approach due to poor post-filter results");
-
-                    // Pre-filter: Get filtered IDs and do bruteforce search
-                    auto filtered_ids =
-                            entry.vector_storage->filter_store_->getIdsMatchingFilter(filter_array);
-                    LOG_DEBUG("Pre-filter: got " << filtered_ids.size() << " filtered IDs");
-
-                    if(!filtered_ids.empty()) {
-                        // Convert size_t to size_t for batch retrieval
-                        std::vector<ndd::idInt> numeric_ids(filtered_ids.begin(),
-                                                            filtered_ids.end());
-
-                        // Get vectors for filtered IDs
-                        auto vector_batch = entry.vector_storage->get_vectors_batch(numeric_ids);
-                        LOG_DEBUG("Pre-filter: retrieved " << vector_batch.size() << " vectors");
-
-                        // Prepare subset for bruteforce search
-                        std::vector<std::pair<idInt, std::vector<uint8_t>>> vector_subset;
-                        vector_subset.reserve(vector_batch.size());
-
-                        for(const auto& [numeric_id, vec_bytes] : vector_batch) {
-                            vector_subset.emplace_back(static_cast<idInt>(numeric_id), vec_bytes);
-                        }
-
-                        // Perform bruteforce search on subset using HNSW's space interface
-                        ndd::quant::QuantizationLevel quant_level = entry.alg->getQuantLevel();
-                        auto space = entry.alg->getSpace();
-                        std::vector<uint8_t> query_bytes =
-                                ndd::quant::get_quantizer_dispatch(quant_level).quantize(query);
-                        auto prefilter_results = hnswlib::searchKnnSubset<float>(
-                                query_bytes.data(), vector_subset, k, space);
-
-                        LOG_DEBUG("Pre-filter: bruteforce search returned "
-                                  << prefilter_results.size() << " results");
-
-                        // Convert results to VectorResult format
-                        std::vector<ndd::VectorResult> prefilter_final_results;
-                        prefilter_final_results.reserve(prefilter_results.size());
-
-                        for(const auto& [distance, label] : prefilter_results) {
-                            ndd::idInt numeric_id = static_cast<ndd::idInt>(label);
-                            ndd::VectorMeta meta = entry.vector_storage->get_meta(numeric_id);
-
-                            ndd::VectorResult result;
-                            result.id = meta.id;
-                            result.filter = meta.filter;
-                            result.meta = meta.meta;
-
-                            if(entry.alg->getSpaceType() == hnswlib::COSINE_SPACE
-                               || entry.alg->getSpaceType() == hnswlib::IP_SPACE) {
-                                result.similarity = 1.0f - distance;
-                            } else {
-                                result.similarity = distance;
-                            }
-
-                            result.norm = meta.norm;
-
-                            if(include_vectors) {
-                                // Find the vector bytes from our batch
-                                auto it = std::find_if(vector_batch.begin(),
-                                                       vector_batch.end(),
-                                                       [numeric_id](const auto& pair) {
-                                                           return pair.first == numeric_id;
-                                                       });
-
-                                if(it != vector_batch.end()) {
-                                    const auto& vec_bytes = it->second;
-
-                                    ndd::quant::QuantizationLevel quant_level =
-                                            entry.alg->getQuantLevel();
-                                    std::vector<float> float_data =
-                                            ndd::quant::get_quantizer_dispatch(quant_level)
-                                                    .dequantize(vec_bytes.data(),
-                                                                entry.alg->getDimension());
-                                    result.vector = {float_data.begin(), float_data.end()};
-                                }
-                            }
-
-                            prefilter_final_results.push_back(std::move(result));
-                        }
-
-                        return prefilter_final_results;
-                    }
-                } else {
-                    LOG_DEBUG("Filter cardinality too high for pre-filtering ("
-                              << filter_cardinality
-                              << " >= " << params.prefilter_threshold
-                              << "), returning post-filter results");
-                }
-            }
-
             // Ensure we don't return more than k results
             if(results.size() > k) {
                 results.resize(k);
             }
             return results;
         } catch(const std::exception& e) {
-            std::cerr << "Search error: " << e.what() << std::endl;
+            LOG_ERROR(2039, index_id, "Search failed: " << e.what());
             return std::nullopt;
         }
     }
@@ -1614,6 +1595,8 @@ public:
         // Remove from in-memory structures if loaded
         auto it = indices_.find(index_id);
         if(it != indices_.end()) {
+            std::lock_guard<std::mutex> operation_lock(it->second.operation_mutex);
+
             auto indx_it = std::find(indices_list_.begin(), indices_list_.end(), index_id);
             if(indx_it != indices_list_.end()) {
                 indices_list_.erase(indx_it);
@@ -1649,7 +1632,8 @@ public:
                 return true;
             }
         } catch(const std::filesystem::filesystem_error& e) {
-            std::cerr << "Failed to move index to deleted directory: " << e.what() << std::endl;
+            LOG_ERROR(
+                    2040, index_id, "Failed to move index to deleted directory: " << e.what());
             return false;
         }
 
@@ -1660,7 +1644,7 @@ public:
         auto& entry = getIndexEntry(index_id);
         IndexInfo indx = {entry.alg->getElementsCount(),
                           entry.alg->getDimension(),
-                          entry.sparse_dim,
+                          entry.sparse_model,
                           entry.alg->getSpaceTypeStr(),
                           entry.alg->getQuantLevel(),
                           entry.alg->getChecksum(),
@@ -1680,7 +1664,7 @@ public:
         entries.reserve(numeric_ids.size());
 
         for(size_t i = 0; i < numeric_ids.size(); i++) {
-            if(numeric_ids[i].first) {
+            if(numeric_ids[i].second) {
                 entries.push_back({
                         WALOperationType::VECTOR_ADD,
                         numeric_ids[i].first,
@@ -1735,7 +1719,7 @@ public:
                                                 const std::string& username);
 
     // Forwarding methods (no IndexManager internals needed)
-    std::vector<std::string> listBackups(const std::string& username) {
+    nlohmann::json listBackups(const std::string& username) {
         return backup_store_.listBackups(username);
     }
 
@@ -1755,6 +1739,54 @@ public:
 
     std::pair<bool, std::string> validateBackupName(const std::string& backup_name) const {
         return backup_store_.validateBackupName(backup_name);
+    }
+
+    // Metadata access
+    std::optional<IndexMetadata> getMetadata(const std::string& index_id) {
+        return metadata_manager_->getMetadata(index_id);
+    }
+
+    // Index stats (safe to call from routes)
+    size_t getElementCount(const std::string& index_id) {
+        auto& entry = getIndexEntry(index_id);
+        return entry.alg->getElementsCount();
+    }
+
+
+    // ========== Rebuild operations ==========
+
+    // Orchestration method (defined below after class)
+    std::pair<bool, std::string> rebuildIndexAsync(const std::string& index_id,
+                                                    size_t new_M,
+                                                    size_t new_ef_con);
+
+    bool hasActiveRebuild(const std::string& username) const {
+        return rebuild_.hasActiveRebuild(username);
+    }
+
+    nlohmann::json getRebuildProgress(const std::string& username,
+                                      const std::string& index_id) const {
+        auto state = rebuild_.getActiveRebuild(username);
+        if (state && state->index_id == index_id) {
+            size_t processed = state->vectors_processed.load();
+            size_t total = state->total_vectors.load();
+            double percent = total > 0 ? (100.0 * processed / total) : 0.0;
+            nlohmann::json result = {
+                {"status", state->status},
+                {"vectors_processed", processed},
+                {"total_vectors", total},
+                {"percent_complete", percent},
+                {"started_at", Rebuild::formatTime(state->started_at)}
+            };
+            if (state->status == "completed" || state->status == "failed") {
+                result["completed_at"] = Rebuild::formatTime(state->completed_at);
+            }
+            if (state->status == "failed" && !state->error_message.empty()) {
+                result["error"] = state->error_message;
+            }
+            return result;
+        }
+        return {{"status", "idle"}};
     }
 };
 
@@ -1809,14 +1841,15 @@ inline void IndexManager::executeBackupJob(const std::string& index_id, const st
             metadata_json["params"] = {{"M", meta->M},
                            {"ef_construction", meta->ef_con},
                            {"dim", meta->dimension},
-                           {"sparse_dim", meta->sparse_dim},
+                           {"sparse_model",
+                            ndd::sparseScoringModelToString(meta->sparse_model)},
                            {"space_type", meta->space_type_str},
                            {"quant_level", static_cast<int>(meta->quant_level)},
                            {"total_elements", meta->total_elements},
                            {"checksum", meta->checksum}};
             LOG_DEBUG("Metadata prepared for backup: " << metadata_json.dump());
         } else {
-            LOG_ERROR("Failed to get metadata for index: " << index_id);
+            LOG_ERROR(2041, index_id, "Failed to get metadata for backup");
             throw std::runtime_error("Cannot create backup without index metadata");
         }
 
@@ -1863,7 +1896,7 @@ inline void IndexManager::executeBackupJob(const std::string& index_id, const st
 
         backup_store_.clearActiveBackup(username);
 
-        LOG_INFO("Backup tar created, write operations now allowed for index: " << index_id);
+        LOG_INFO(2042, index_id, "Backup tar created; write operations resumed");
 
         std::filesystem::rename(backup_tar_temp, backup_tar_final);
 
@@ -1871,7 +1904,7 @@ inline void IndexManager::executeBackupJob(const std::string& index_id, const st
         backup_db[backup_name] = metadata_json;
         backup_store_.writeBackupJson(username, backup_db);
 
-        LOG_INFO("Backup completed: " << backup_name << " -> " << backup_tar_final);
+        LOG_INFO(2043, index_id, "Backup completed: " << backup_name << " -> " << backup_tar_final);
 
     } catch (const std::exception& e) {
         std::string user_backup_dir = backup_store_.getUserBackupDir(username);
@@ -1893,7 +1926,7 @@ inline void IndexManager::executeBackupJob(const std::string& index_id, const st
 
         backup_store_.clearActiveBackup(username);
 
-        LOG_ERROR("Backup failed: " << backup_name << " - " << e.what());
+        LOG_ERROR(2044, index_id, "Backup failed for " << backup_name << ": " << e.what());
     }
 }
 
@@ -1959,12 +1992,14 @@ inline std::pair<bool, std::string> IndexManager::restoreBackup(const std::strin
         IndexMetadata new_meta;
         new_meta.name = target_index_name;
         new_meta.dimension = meta_json["params"]["dim"];
-        new_meta.sparse_dim = meta_json["params"].value("sparse_dim", 0ul);
         new_meta.M = meta_json["params"]["M"];
         new_meta.ef_con = meta_json["params"]["ef_construction"];
         new_meta.space_type_str = meta_json["params"]["space_type"];
         new_meta.quant_level = static_cast<ndd::quant::QuantizationLevel>(
                 meta_json["params"]["quant_level"].get<int>());
+        const auto sparse_model = ndd::sparseScoringModelFromString(
+                meta_json["params"]["sparse_model"].get<std::string>());
+        new_meta.sparse_model = *sparse_model;
         new_meta.created_at = std::chrono::system_clock::now();
         new_meta.total_elements = meta_json["params"].value("total_elements", 0ul);
         new_meta.checksum = meta_json["params"].value("checksum", -1);
@@ -1975,7 +2010,7 @@ inline std::pair<bool, std::string> IndexManager::restoreBackup(const std::strin
 
         loadIndex(target_index_id);
 
-        LOG_INFO("Restored backup from compressed archive: " << backup_tar);
+        LOG_INFO(2045, username, target_index_name, "Restored backup from " << backup_tar);
         return {true, ""};
     } catch(const std::exception& e) {
         std::filesystem::remove_all(backup_extract_dir);
@@ -2016,7 +2051,218 @@ inline std::pair<bool, std::string> IndexManager::createBackupAsync(const std::s
         executeBackupJob(index_id, backup_name);
     }).detach();
 
-    LOG_INFO("Backup started: " << backup_name << " for index: " << index_id);
+    LOG_INFO(2046, index_id, "Backup started: " << backup_name);
 
     return {true, backup_name};
+}
+
+// ========== IndexManager rebuild implementations ==========
+
+inline std::pair<bool, std::string> IndexManager::rebuildIndexAsync(const std::string& index_id,
+                                                                     size_t new_M,
+                                                                     size_t new_ef_con) {
+    // Validate index exists
+    auto meta = metadata_manager_->getMetadata(index_id);
+    if (!meta) {
+        return {false, "Index not found"};
+    }
+
+    // Extract username for backup check
+    std::string username;
+    size_t pos = index_id.find('/');
+    if (pos != std::string::npos) {
+        username = index_id.substr(0, pos);
+    } else {
+        return {false, "Invalid index ID format"};
+    }
+
+    // Check for active backup or rebuild
+    if (backup_store_.hasActiveBackup(username)) {
+        return {false, "Backup already in progress for user: " + username};
+    }
+    if (rebuild_.hasActiveRebuild(username)) {
+        return {false, "Rebuild already in progress for user: " + username};
+    }
+
+    // Load entry to get current element count
+    auto& entry = getIndexEntry(index_id);
+    size_t current_count = entry.alg->getElementsCount();
+
+    // Ensure at least one parameter differs
+    if (new_M == meta->M && new_ef_con == meta->ef_con) {
+        return {false, "No configuration changes specified"};
+    }
+
+    // Set active rebuild state (per-user, one rebuild at a time)
+    rebuild_.setActiveRebuild(username, index_id, current_count);
+
+    // Spawn background thread (same pattern as createBackupAsync)
+    std::thread([this, index_id, username, new_M, new_ef_con]() {
+        executeRebuildJob(index_id, username, new_M, new_ef_con);
+    }).detach();
+
+    LOG_INFO(2050, index_id, "Rebuild started: M=" << new_M
+                              << " ef_con=" << new_ef_con);
+
+    return {true, "Rebuild started"};
+}
+
+inline void IndexManager::executeRebuildJob(const std::string& index_id,
+                                             const std::string& username,
+                                             size_t new_M, size_t new_ef_con) {
+    std::string base_path = data_dir_ + "/" + index_id;
+    std::string temp_path = rebuild_.getTempPath(base_path);
+    std::string timestamped_path = rebuild_.getTimestampedPath(base_path);
+    std::string vector_storage_dir = base_path + "/vectors";
+    std::string index_path = vector_storage_dir + "/" + settings::DEFAULT_SUBINDEX + ".idx";
+
+    try {
+        auto& entry = getIndexEntry(index_id);
+
+        // Hold operation_mutex for entire rebuild — writes timeout, searches continue
+        std::lock_guard<std::mutex> operation_lock(entry.operation_mutex);
+
+        // Phase 1 — Save current state
+        saveIndexInternal(entry);
+
+        // Read current config from the existing HNSW graph
+        auto space_type = entry.alg->getSpaceType();
+        size_t dim = entry.alg->getDimension();
+        auto quant_level = entry.alg->getQuantLevel();
+        int32_t checksum = entry.alg->getChecksum();
+        size_t max_elements = entry.alg->getMaxElements();
+
+        // Phase 2 — Build new HNSW (same max_elements as current index)
+        auto new_alg = std::make_unique<hnswlib::HierarchicalNSW<float>>(
+            max_elements, space_type, dim, new_M, new_ef_con,
+            settings::RANDOM_SEED, quant_level, checksum);
+
+        // Set vector fetcher BEFORE adding vectors — searchBaseLayer during
+        // graph construction needs this to compute distances for base-layer-only
+        // nodes (base layer doesn't store vector data inline)
+        new_alg->setVectorFetcher([vs = entry.vector_storage](ndd::idInt label, uint8_t* buffer) {
+            return vs->get_vector(label, buffer);
+        });
+
+        new_alg->setVectorFetcherBatch([vs = entry.vector_storage](const ndd::idInt* labels,
+                                                                     uint8_t* buffers,
+                                                                     bool* success,
+                                                                     size_t count) -> size_t {
+            return vs->get_vectors_batch_into(labels, buffers, success, count);
+        });
+
+        // Iterate VectorStore and re-insert all vectors
+        auto cursor = entry.vector_storage->getCursor();
+        const size_t batch_size = settings::RECOVERY_BATCH_SIZE;
+        size_t total_processed = 0;
+        size_t batches_since_checkpoint = 0;
+        constexpr size_t CHECKPOINT_INTERVAL = 5;  // Save temp every 5 batches
+
+        while (cursor.hasNext()) {
+            // Collect batch
+            std::vector<std::pair<ndd::idInt, std::vector<uint8_t>>> batch;
+            batch.reserve(batch_size);
+            while (cursor.hasNext() && batch.size() < batch_size) {
+                auto [label, vec_bytes] = cursor.next();
+                if (!vec_bytes.empty()) {
+                    batch.emplace_back(label, std::move(vec_bytes));
+                }
+            }
+
+            if (batch.empty()) {
+                break;
+            }
+
+            // Multi-threaded insert (same pattern as addVectors and recoverIndex)
+            size_t num_threads = std::min(settings::NUM_RECOVERY_THREADS, batch.size());
+            std::atomic<size_t> next{0};
+            std::vector<std::thread> threads;
+
+            for (size_t t = 0; t < num_threads; ++t) {
+                threads.emplace_back([&]() {
+                    size_t i;
+                    while ((i = next.fetch_add(1)) < batch.size()) {
+                        const auto& [label, vec_bytes] = batch[i];
+                        new_alg->addPoint<true>(vec_bytes.data(), label);
+                    }
+                });
+            }
+
+            for (auto& th : threads) {
+                th.join();
+            }
+
+            total_processed += batch.size();
+
+            // Update progress
+            auto state = rebuild_.getActiveRebuild(username);
+            if (state) {
+                state->vectors_processed.store(total_processed);
+            }
+
+            // Periodic checkpoint save
+            batches_since_checkpoint++;
+            if (batches_since_checkpoint >= CHECKPOINT_INTERVAL) {
+                new_alg->saveIndex(temp_path);
+                batches_since_checkpoint = 0;
+            }
+        }
+
+        // Phase 3 — Save final + Copy + Swap
+
+        // Save new graph to timestamped file 
+        new_alg->saveIndex(timestamped_path);
+
+        // Copy to canonical name (overwrites old default.idx on disk)
+        std::filesystem::copy_file(timestamped_path, index_path,
+            std::filesystem::copy_options::overwrite_existing);
+
+        // Load fresh from disk + swap pointer (reloadIndex pattern)
+        auto fresh_alg = std::make_unique<hnswlib::HierarchicalNSW<float>>(index_path, 0);
+
+        fresh_alg->setVectorFetcher([vs = entry.vector_storage](ndd::idInt label, uint8_t* buffer) {
+            return vs->get_vector(label, buffer);
+        });
+
+        fresh_alg->setVectorFetcherBatch([vs = entry.vector_storage](const ndd::idInt* labels,
+                                                                       uint8_t* buffers,
+                                                                       bool* success,
+                                                                       size_t count) -> size_t {
+            return vs->get_vectors_batch_into(labels, buffers, success, count);
+        });
+
+        entry.alg = std::move(fresh_alg);
+
+        // Delete temp checkpoint and timestamped file
+        if (std::filesystem::exists(temp_path)) {
+            std::filesystem::remove(temp_path);
+        }
+        if (std::filesystem::exists(timestamped_path)) {
+            std::filesystem::remove(timestamped_path);
+        }
+
+        // Update metadata with new config
+        auto meta = metadata_manager_->getMetadata(index_id);
+        if (meta) {
+            meta->M = new_M;
+            meta->ef_con = new_ef_con;
+            meta->total_elements = entry.alg->getElementsCount();
+            metadata_manager_->storeMetadata(index_id, *meta);
+        }
+
+        entry.markUpdated();
+        entry.updated = false;  // We just saved the new graph
+
+        LOG_INFO(2051, index_id, "Rebuild completed: " << total_processed << " vectors rebuilt");
+        rebuild_.completeActiveRebuild(username);
+
+    } catch (const std::exception& e) {
+        LOG_ERROR(2052, index_id, "Rebuild failed: " << e.what());
+
+        // Cleanup temp file on error
+        if (std::filesystem::exists(temp_path)) {
+            std::filesystem::remove(temp_path);
+        }
+        rebuild_.failActiveRebuild(username, e.what());
+    }
 }
